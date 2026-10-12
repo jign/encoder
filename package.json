@@ -1,0 +1,29 @@
+{
+  "name": "encoder",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc && vite build",
+    "tauri": "tauri",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:encode": "cargo test --manifest-path src-tauri/Cargo.toml -- --include-ignored --nocapture"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@vanilla/petals": "file:../../design/vanilla/packages/petals",
+    "@vanilla/tokens": "file:../../design/vanilla/packages/tokens",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6",
+    "prettier": "^3.9.10",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16"
+  }
+}
