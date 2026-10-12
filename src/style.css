@@ -790,6 +790,48 @@ footer b {
   gap: 7px;
   cursor: pointer;
 }
+.filesize-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.filesize-input {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: white;
+  border: 1px solid #cdd8e8;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.filesize-input input {
+  width: 76px;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  color: #40618f;
+}
+.filesize-input span {
+  color: #8b99ac;
+  font-size: 10px;
+}
+.filesize-input.disabled {
+  opacity: 0.45;
+  background: #e9edf3;
+}
+.uncapped-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #738199;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.uncapped-toggle input {
+  margin: 0;
+  accent-color: #546f98;
+}
 .mode-tools input,
 .audio-toggle input {
   accent-color: #546f98;

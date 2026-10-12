@@ -13,7 +13,8 @@ let settings = JSON.parse(
 };
 mockIPC(
   (cmd, args) => {
-    if (cmd === "load_settings") return settings;
+    if (cmd === "load_settings")
+      return { target_mb: 3.8, uncapped: false, ...settings };
     if (cmd === "save_settings") {
       settings = (args as Record<string, unknown>).settings;
       localStorage.setItem(

@@ -30,6 +30,13 @@ struct Settings {
     remove_audio: bool,
     today_only: bool,
     last_source: Option<String>,
+    #[serde(default = "default_target_mb")]
+    target_mb: f64,
+    #[serde(default)]
+    uncapped: bool,
+}
+fn default_target_mb() -> f64 {
+    3.8
 }
 #[derive(Serialize)]
 struct SaveLocation {
@@ -143,6 +150,8 @@ fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
         remove_audio: true,
         today_only: true,
         last_source: None,
+        target_mb: default_target_mb(),
+        uncapped: false,
     })
 }
 #[tauri::command]
@@ -510,8 +519,12 @@ fn validate(r: &ExportRequest, m: &Media) -> Result<(), String> {
     {
         return Err("That filename is reserved by Windows.".into());
     }
-    if r.target.is_some_and(|n| n != 3_800_000 && n != 10_000_000) {
-        return Err("Choose 3.8 MB, 10 MB, or Unlimited.".into());
+    if r.target
+        .is_some_and(|n| !(1_000..=9_007_199_254_740_991).contains(&n))
+    {
+        return Err(
+            "Enter a valid filesize limit of at least 0.001 MB, or choose Uncapped.".into(),
+        );
     }
     Ok(())
 }
@@ -711,7 +724,10 @@ fn export(
                 return save_export(&tmp, &output, cancel, scale, quality_warning);
             }
             if attempt == 2 {
-                return Err("Could not meet the filesize limit. Try a shorter clip or the next size preset.".into());
+                return Err(
+                    "Could not meet the filesize limit. Try a shorter clip or a larger limit."
+                        .into(),
+                );
             }
             bitrate =
                 bitrate.map(|b| (b as f64 * r.target.unwrap() as f64 / bytes as f64 * 0.94) as u64);
@@ -887,6 +903,23 @@ mod tests {
         assert!(validate(&r, &m).is_err());
         r.filename = "NUL".into();
         assert!(validate(&r, &m).is_err());
+        r.filename = "demo".into();
+        r.target = Some(1_234_567);
+        assert!(validate(&r, &m).is_ok());
+        r.target = Some(999);
+        assert!(validate(&r, &m).is_err());
+        r.target = None;
+        assert!(validate(&r, &m).is_ok());
+    }
+    #[test]
+    fn old_preferences_keep_their_values_with_default_size_controls() {
+        let old = r#"{"obs_mode":false,"obs_folder":"D:\\Recordings","output_folder":"D:\\Clips","remove_audio":false,"today_only":true,"last_source":null}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(!s.obs_mode);
+        assert!(!s.remove_audio);
+        assert_eq!(s.output_folder, "D:\\Clips");
+        assert_eq!(s.target_mb, 3.8);
+        assert!(!s.uncapped);
     }
     #[test]
     fn even_dimensions_and_speed() {
@@ -950,6 +983,9 @@ mod tests {
             r.end = if speed == 0.25 { 1. } else { 8. };
             r.speed = speed;
             r.remove_audio = false;
+            if speed == 2. {
+                r.target = Some(333_333);
+            }
             r.crop = Crop {
                 x: 0,
                 y: 0,
@@ -968,7 +1004,7 @@ mod tests {
             .unwrap();
             assert!(out.has_audio);
             assert!((out.duration - expected).abs() < 0.12);
-            assert!(out.bytes <= 3_800_000);
+            assert!(out.bytes <= if speed == 2. { 333_333 } else { 3_800_000 });
             let pcm = command("ffmpeg")
                 .args(["-v", "error", "-ss", "0.2", "-i"])
                 .arg(&out.path)
@@ -1008,6 +1044,7 @@ mod tests {
         r.filename = "silent".into();
         r.end = 2.;
         r.remove_audio = false;
+        r.target = Some(2_200_000);
         r.crop = Crop {
             x: 0,
             y: 0,
@@ -1120,6 +1157,7 @@ mod tests {
             height: m.height,
         };
         r.remove_audio = false;
+        r.target = Some(2_200_000);
         let out = export(
             None,
             &AtomicBool::new(false),
@@ -1129,7 +1167,7 @@ mod tests {
             &root.join("work"),
         )
         .unwrap();
-        assert!(out.bytes <= 3_800_000);
+        assert!(out.bytes <= 2_200_000);
         assert_eq!(out.has_audio, m.has_audio);
         assert!((out.duration - m.duration).abs() < 0.15);
         println!(

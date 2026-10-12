@@ -18,6 +18,8 @@ type Settings = {
   remove_audio: boolean;
   today_only: boolean;
   last_source: string | null;
+  target_mb: number;
+  uncapped: boolean;
 };
 type Crop = { x: number; y: number; width: number; height: number };
 type Progress = { stage: string; fraction: number };
@@ -93,6 +95,15 @@ export default function App() {
   const obsFolder = settings?.obs_folder;
   const removeAudio = settings?.remove_audio ?? true;
   const outputFolder = settings?.output_folder ?? "";
+  const targetMb = settings?.target_mb ?? 3.8;
+  const uncapped = settings?.uncapped ?? false;
+  const targetBytes = Math.round(targetMb * 1_000_000);
+  const target = uncapped ? null : targetBytes;
+  const validTarget =
+    uncapped ||
+    (Number.isFinite(targetMb) &&
+      Number.isSafeInteger(targetBytes) &&
+      targetBytes >= 1_000);
   const updateSettings = (patch: Partial<Settings>) =>
     setSettings((s) => (s ? { ...s, ...patch } : s));
   const setTodayOnly = (value: boolean | ((value: boolean) => boolean)) =>
@@ -105,7 +116,6 @@ export default function App() {
   const [start, setStart] = useState(0),
     [end, setEnd] = useState(0),
     [speed, setSpeed] = useState(1);
-  const [target, setTarget] = useState<number | null>(3_800_000);
   const [filename, setFilename] = useState("");
   const [crop, setCrop] = useState<Crop>({ x: 0, y: 0, width: 2, height: 2 });
   const [cropping, setCropping] = useState(false);
@@ -315,7 +325,8 @@ export default function App() {
     speed <= 8 &&
     filename.trim().length > 0 &&
     !sourceDirty &&
-    !!outputFolder;
+    !!outputFolder &&
+    validTarget;
   function seek(t: number) {
     const v = sourceVideo.current;
     if (!v) return;
@@ -566,12 +577,27 @@ export default function App() {
         setCompare((v) => !v);
       },
     },
-    ...[3_800_000, 10_000_000, null].map((n) => ({
-      id: String(n),
-      label: `Size · ${n === null ? "Unlimited" : n === 3_800_000 ? "3.8 MB" : "10 MB"}`,
-      disabled: busy,
-      run: () => setTarget(n),
-    })),
+    {
+      id: "target-size",
+      label: "Set target filesize",
+      disabled: busy || !settings,
+      run: () => {
+        updateSettings({ uncapped: false });
+        requestAnimationFrame(() => {
+          const input = document.getElementById(
+            "target-mb",
+          ) as HTMLInputElement | null;
+          input?.focus();
+          input?.select();
+        });
+      },
+    },
+    {
+      id: "uncapped",
+      label: uncapped ? "Use filesize limit" : "Use uncapped encoding",
+      disabled: busy || !settings,
+      run: () => updateSettings({ uncapped: !uncapped }),
+    },
   ];
   return (
     <div className={`app ${obsMode ? "" : "obs-off"}`}>
@@ -1119,22 +1145,35 @@ export default function App() {
         )}
         <div className="export-bar">
           <div className="size-control">
-            <label>SIZE LIMIT</label>
-            <div className="segmented">
-              {[3_800_000, 10_000_000, null].map((n) => (
-                <button
-                  key={String(n)}
-                  disabled={busy}
-                  className={target === n ? "active" : ""}
-                  onClick={() => setTarget(n)}
-                >
-                  {n === null
-                    ? "Unlimited"
-                    : n === 3_800_000
-                      ? "3.8 MB"
-                      : "10 MB"}
-                </button>
-              ))}
+            <label htmlFor="target-mb">SIZE LIMIT</label>
+            <div className="filesize-control">
+              <div className={`filesize-input ${uncapped ? "disabled" : ""}`}>
+                <input
+                  id="target-mb"
+                  aria-label="Target filesize in MB"
+                  type="number"
+                  min="0.001"
+                  step="any"
+                  disabled={busy || uncapped || !settings}
+                  value={targetMb}
+                  aria-invalid={!validTarget}
+                  onChange={(e) =>
+                    updateSettings({ target_mb: Number(e.target.value) })
+                  }
+                />
+                <span>MB</span>
+              </div>
+              <label className="uncapped-toggle">
+                <input
+                  type="checkbox"
+                  checked={uncapped}
+                  disabled={busy || !settings}
+                  onChange={(e) =>
+                    updateSettings({ uncapped: e.target.checked })
+                  }
+                />{" "}
+                Uncapped
+              </label>
             </div>
           </div>
           <label className="filename">
@@ -1167,6 +1206,12 @@ export default function App() {
             Export clip <Icon name="arrow" />
           </button>
         </div>
+        {!validTarget && (
+          <div className="notice" role="alert">
+            Enter a positive filesize limit of at least 0.001 MB, or enable
+            Uncapped.
+          </div>
+        )}
         <div className="export-note">
           {target === null
             ? "Quality first · CRF 23"
