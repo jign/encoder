@@ -12,8 +12,8 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@vanilla/petals": "file:../../design/vanilla/packages/petals",
-    "@vanilla/tokens": "file:../../design/vanilla/packages/tokens",
+    "@vanilla/petals": "file:vendor/vanilla/petals",
+    "@vanilla/tokens": "file:vendor/vanilla/tokens",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

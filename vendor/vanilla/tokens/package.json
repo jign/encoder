@@ -1,0 +1,13 @@
+{
+  "name": "@vanilla/tokens",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vanilla design tokens and fonts",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": "./index.css",
+    "./tokens.css": "./tokens.css",
+    "./fonts.css": "./fonts.css"
+  },
+  "files": ["index.css", "tokens.css", "fonts.css", "fonts"]
+}

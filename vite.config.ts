@@ -7,7 +7,7 @@ export default defineConfig({
     watch: { ignored: ["**/src-tauri/**", "**/.work/**"] },
     port: 1427,
     strictPort: true,
-    fs: { allow: [".", "../../design/vanilla"] },
+    fs: { allow: ["."] },
   },
   clearScreen: false,
 });

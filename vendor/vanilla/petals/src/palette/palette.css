@@ -1,0 +1,239 @@
+/*
+ * Palette — Vanilla Petals. Living draft.
+ * Glass surface, charcoal text on a blue-tinted active row, instant close.
+ * compact = Quick Pose, comfortable = Whitebloom.
+ *
+ * The glass is a <GlassLayer> child behind the content (see glass/GlassLayer), never this element's own
+ * backdrop-filter: frosted islands (.vp-frost) inside a backdrop-filter parent could not blur the page.
+ * The panel therefore must not become a backdrop root: no opacity, filter, mask or clip-path here.
+ */
+
+.vp-palette-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-palette);
+}
+
+.vp-palette {
+  --vp-row-h: 26px;
+  position: absolute;
+  top: 15vh;
+  left: 50%;
+  width: min(560px, calc(100vw - 32px));
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  isolation: isolate; /* the glass layer sits at z-index -1 inside this */
+  border-radius: var(--radius-float);
+  box-shadow: var(--palette-shadow, var(--shadow-elevated));
+  color: var(--ink-1);
+  font: var(--fs-sm) / var(--lh-ui) var(--font-sans);
+  /* Opens with a scale too short to wait for; closes in zero frames. */
+  animation: vp-palette-open 80ms ease-out;
+}
+
+/* Edge and top highlight, drawn above the glass layer and the content. */
+.vp-palette::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: var(--glass-edge-width) solid var(--glass-edge);
+  border-radius: inherit;
+  box-shadow: var(--highlight-top);
+  pointer-events: none;
+}
+
+.vp-palette--lens {
+  box-shadow: var(--palette-shadow, var(--lens-shadow));
+}
+
+.vp-palette--lens::after {
+  border: none;
+  box-shadow: var(--lens-rim);
+}
+
+@keyframes vp-palette-open {
+  from {
+    transform: translateX(-50%) scale(0.98);
+  }
+  to {
+    transform: translateX(-50%) scale(1);
+  }
+}
+
+.vp-palette__input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  height: 40px;
+  padding: 0 var(--sp-5);
+  border: none;
+  border-bottom: var(--palette-divider-width, 0px) solid var(--line-faint);
+  outline: none;
+  background: transparent;
+  color: var(--ink-1);
+  font: var(--fs-lg) / var(--lh-ui) var(--font-sans);
+}
+
+.vp-palette__input::placeholder {
+  color: var(--ink-3);
+}
+
+.vp-palette__header {
+  padding: var(--sp-4) var(--sp-5) var(--sp-3);
+  border-bottom: var(--palette-divider-width, 0px) solid var(--line-faint);
+}
+
+.vp-palette__header-title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+}
+
+.vp-palette__header-description {
+  margin-top: var(--sp-0);
+  color: var(--ink-3);
+}
+
+.vp-palette__list {
+  box-sizing: content-box;
+  max-height: calc(var(--vp-palette-rows) * var(--vp-row-h));
+  padding: var(--sp-1) var(--palette-list-inset, 0px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Thin scrollbar: the default one is too heavy on glass. */
+.vp-palette__list::-webkit-scrollbar {
+  width: 8px;
+}
+.vp-palette__list::-webkit-scrollbar-track {
+  background: transparent;
+}
+.vp-palette__list::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: var(--radius-pill);
+}
+
+.vp-palette__row {
+  display: flex;
+  align-items: center;
+  height: var(--vp-row-h);
+  padding: 0 var(--sp-5);
+  border-radius: var(--palette-row-radius, var(--palette-inner-radius, 0px));
+  white-space: nowrap;
+  cursor: default;
+}
+
+.vp-palette__row.is-active {
+  background: var(--select-bg);
+}
+
+.vp-palette__row.is-disabled {
+  opacity: 0.4;
+}
+
+.vp-palette__text {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.vp-palette__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vp-palette__hit {
+  background: none;
+  color: inherit;
+  font-weight: var(--fw-bold);
+}
+
+.vp-palette__description {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink-3);
+  font-size: var(--fs-xs);
+}
+
+.vp-palette__category {
+  flex: none;
+  margin-left: var(--sp-3);
+  color: var(--ink-3);
+  font-size: var(--fs-xs);
+}
+
+.vp-palette__shortcut {
+  flex: none;
+  margin-left: auto;
+  padding-left: var(--sp-6);
+  color: var(--ink-3);
+  font: var(--fs-xs) / var(--lh-ui) var(--font-mono);
+  white-space: pre;
+}
+
+.vp-palette__empty {
+  padding: var(--sp-2) var(--sp-5);
+  color: var(--ink-3);
+}
+
+/* ── Comfortable: rich rows ──────────────────────────────── */
+
+.vp-palette--comfortable {
+  --vp-row-h: 36px;
+}
+
+.vp-palette--comfortable .vp-palette__list {
+  padding: var(--sp-1) var(--palette-list-inset, 0px);
+}
+
+.vp-palette--comfortable .vp-palette__row {
+  gap: var(--sp-4);
+  height: auto;
+  min-height: var(--vp-row-h);
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--palette-row-radius, var(--palette-inner-radius, 0px));
+  font-size: var(--fs-md);
+}
+
+.vp-palette--comfortable .vp-palette__row.has-description .vp-palette__text {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+}
+
+.vp-palette--comfortable .vp-palette__icon {
+  display: inline-flex;
+  flex: none;
+  width: var(--icon-md);
+  justify-content: center;
+  color: var(--ink-2);
+}
+
+.vp-palette__heading {
+  padding: var(--sp-3) var(--sp-4) var(--sp-1);
+  color: var(--ink-3);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  user-select: none;
+}
+
+/* ── Lens surface: the rim refracts raw; a feathered white wash covers the content area ── */
+
+.vp-palette__wash {
+  position: absolute;
+  inset: var(--lens-content-inset);
+  z-index: -1; /* after the glass layer in the DOM, so above it; below all content */
+  border-radius: max(0px, calc(var(--radius-float) - var(--lens-content-inset)));
+  background: rgba(255, 255, 255, var(--lens-content-wash));
+  box-shadow: 0 0 var(--lens-content-feather) calc(var(--lens-content-feather) / 2)
+    rgba(255, 255, 255, var(--lens-content-wash));
+  pointer-events: none;
+}

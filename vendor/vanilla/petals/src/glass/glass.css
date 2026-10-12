@@ -1,0 +1,36 @@
+/*
+ * Glass — Vanilla Petals. Living draft. See study/06-glass.md, study/07-glass-frost.md.
+ * Tokens: --lens-* (refraction), --frost-* (legibility islands), --glass-* (the frosted recipe).
+ */
+
+/* The material layer. First child of a floating panel; z-index -1 puts it behind the panel's content,
+   so the panel must be a stacking context (transform, position+z-index, or isolation: isolate). */
+.vp-glass {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* Tier 0: today's frosted glass. Also what the lens falls back to. */
+.vp-glass--frost {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+}
+
+/* Tier 1: the backdrop-filter itself is inline, because it names this instance's SVG filter. */
+.vp-glass--lens {
+  background: var(--lens-wash);
+}
+
+/*
+ * Frost: a legible island on glass (input, active row, toolbar button).
+ * Works ONLY on elements that are not inside a backdrop-filter ancestor; keep the lens on a
+ * <GlassLayer> sibling, never on the panel.
+ */
+.vp-frost {
+  backdrop-filter: var(--frost-filter);
+  background-color: var(--frost-wash);
+  box-shadow: var(--frost-edge);
+}

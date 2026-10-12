@@ -4,10 +4,10 @@ A focused Windows desktop tool for turning recordings into small web demos, with
 
 ## Run
 
-Requires Node.js, Rust with the MSVC toolchain, WebView2, and `ffmpeg` / `ffprobe` on PATH. The Vanilla checkout is linked at `../../design/vanilla`.
+Requires Node.js, Rust with the MSVC toolchain, WebView2, and `ffmpeg` / `ffprobe` on PATH. The Vanilla components and fonts used by the app are included under `vendor/vanilla`; no other project checkout is required.
 
 ```powershell
-npm install
+npm ci
 npm run tauri dev
 ```
 
