@@ -2,26 +2,44 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
 use tauri::{Emitter, Manager};
-const OBS: &str = "E:\\cache\\obs";
 #[derive(Default)]
 struct Jobs {
     busy: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    exports: Mutex<Vec<PathBuf>>,
+    settings_lock: Mutex<()>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct Settings {
+    obs_mode: bool,
+    obs_folder: Option<String>,
+    output_folder: String,
+    remove_audio: bool,
+    today_only: bool,
+    last_source: Option<String>,
+}
+#[derive(Serialize)]
+struct SaveLocation {
+    folder: String,
+    filename: String,
 }
 #[derive(Serialize)]
 struct Recording {
     name: String,
+    path: String,
     bytes: u64,
 }
 #[derive(Serialize, Deserialize, Clone)]
@@ -29,6 +47,7 @@ struct Media {
     duration: f64,
     width: u32,
     height: u32,
+    has_audio: bool,
 }
 #[derive(Deserialize, Clone)]
 struct Crop {
@@ -41,6 +60,8 @@ struct Crop {
 struct ExportRequest {
     source: String,
     filename: String,
+    output_folder: String,
+    remove_audio: bool,
     start: f64,
     end: f64,
     speed: f64,
@@ -56,6 +77,7 @@ struct ExportResult {
     duration: f64,
     scale: f64,
     quality_warning: bool,
+    has_audio: bool,
 }
 #[derive(Serialize, Clone)]
 struct Progress {
@@ -84,33 +106,125 @@ fn conventional(name: &str) -> bool {
             _ => c.is_ascii_digit(),
         })
 }
-fn source(name: &str) -> Result<PathBuf, String> {
-    if !conventional(name) {
-        return Err("Select a conventional OBS recording.".into());
+fn source(path: &str) -> Result<PathBuf, String> {
+    let p = Path::new(path.trim().trim_matches('"'));
+    if !p.is_absolute() {
+        return Err("Enter an absolute source filepath or use Browse.".into());
     }
-    let p = Path::new(OBS).join(name);
     let p = p.canonicalize().map_err(|e| e.to_string())?;
-    if p.parent()
-        != Some(
-            Path::new(OBS)
-                .canonicalize()
-                .map_err(|e| e.to_string())?
-                .as_path(),
-        )
-    {
-        return Err("Recording must be inside the OBS folder.".into());
+    if !p.is_file() {
+        return Err("Select a video file.".into());
     }
     Ok(p)
+}
+fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(unc) = s.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{unc}")
+    } else {
+        s.trim_start_matches("\\\\?\\").to_string()
+    }
+}
+#[tauri::command]
+fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
+    let data = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let path = data.join("settings.json");
+    if path.exists() {
+        return serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("Could not load preferences: {e}"));
+    }
+    // Migrate the original installation once; fresh installations start without an OBS folder.
+    let legacy = Path::new("E:\\cache\\obs");
+    let existing = app.path().app_cache_dir().is_ok_and(|p| p.exists());
+    Ok(Settings {
+        obs_mode: true,
+        obs_folder: (existing && legacy.is_dir()).then(|| display_path(legacy)),
+        output_folder: display_path(&data.join("exports")),
+        remove_audio: true,
+        today_only: true,
+        last_source: None,
+    })
+}
+#[tauri::command]
+fn save_settings(
+    app: tauri::AppHandle,
+    jobs: tauri::State<Jobs>,
+    settings: Settings,
+) -> Result<(), String> {
+    let _lock = jobs.settings_lock.lock().map_err(|e| e.to_string())?;
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join("settings.tmp");
+    fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    fs::rename(tmp, dir.join("settings.json")).map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn choose_obs_folder(current: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut d = rfd::FileDialog::new().set_title("Choose OBS recordings folder");
+        if let Some(p) = current {
+            d = d.set_directory(p);
+        }
+        d.pick_folder().map(|p| display_path(&p))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn choose_source(current: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut d = rfd::FileDialog::new()
+            .set_title("Open a video")
+            .add_filter("Video", &["mkv", "mp4", "mov", "webm", "avi", "m4v", "ts"])
+            .add_filter("All files", &["*"]);
+        if let Some(p) = current.and_then(|p| Path::new(&p).parent().map(Path::to_path_buf)) {
+            d = d.set_directory(p);
+        }
+        d.pick_file().map(|p| display_path(&p))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn choose_destination(
+    folder: String,
+    filename: String,
+) -> Result<Option<SaveLocation>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = if filename.to_lowercase().ends_with(".mp4") {
+            filename
+        } else {
+            format!("{filename}.mp4")
+        };
+        rfd::FileDialog::new()
+            .set_title("Choose export location")
+            .set_directory(folder)
+            .set_file_name(name)
+            .add_filter("MP4 video", &["mp4"])
+            .save_file()
+            .map(|p| SaveLocation {
+                folder: display_path(p.parent().unwrap_or(Path::new("."))),
+                filename: p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 fn probe(p: &Path) -> Result<Media, String> {
     let o = command("ffprobe")
         .args([
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "stream=width,height:format=duration",
+            "stream=codec_type,width,height:format=duration",
             "-of",
             "json",
         ])
@@ -123,13 +237,19 @@ fn probe(p: &Path) -> Result<Media, String> {
         return Err(String::from_utf8_lossy(&o.stderr).into());
     }
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())?;
+    let streams = v["streams"].as_array().ok_or("No readable streams.")?;
+    let video = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .ok_or("No video track.")?;
     let m = Media {
         duration: v["format"]["duration"]
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.),
-        width: v["streams"][0]["width"].as_u64().unwrap_or(0) as u32,
-        height: v["streams"][0]["height"].as_u64().unwrap_or(0) as u32,
+        width: video["width"].as_u64().unwrap_or(0) as u32,
+        height: video["height"].as_u64().unwrap_or(0) as u32,
+        has_audio: streams.iter().any(|s| s["codec_type"] == "audio"),
     };
     if m.duration <= 0. || m.width < 2 || m.height < 2 {
         return Err("Recording is incomplete or has no readable video.".into());
@@ -137,10 +257,10 @@ fn probe(p: &Path) -> Result<Media, String> {
     Ok(m)
 }
 #[tauri::command]
-fn list_recordings(today_only: bool) -> Result<Vec<Recording>, String> {
+fn list_recordings(folder: String, today_only: bool) -> Result<Vec<Recording>, String> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut list: Vec<_> = fs::read_dir(OBS)
-        .map_err(|e| format!("Cannot read {OBS}: {e}"))?
+    let mut list: Vec<_> = fs::read_dir(&folder)
+        .map_err(|e| format!("Cannot read {folder}: {e}"))?
         .filter_map(Result::ok)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -148,6 +268,7 @@ fn list_recordings(today_only: bool) -> Result<Vec<Recording>, String> {
             (m.is_file() && conventional(&name) && (!today_only || name.starts_with(&today)))
                 .then_some(Recording {
                     name,
+                    path: display_path(&e.path()),
                     bytes: m.len(),
                 })
         })
@@ -292,7 +413,11 @@ async fn prepare_preview(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|t| t.as_secs())
             .unwrap_or(0);
-        let preview = dir.join(format!("{name}-{}-{stamp}.mp4", meta.len()));
+        let mut hash = DefaultHasher::new();
+        p.hash(&mut hash);
+        meta.len().hash(&mut hash);
+        stamp.hash(&mut hash);
+        let preview = dir.join(format!("preview-audio-v2-{:016x}.mp4", hash.finish()));
         if !preview.exists() {
             let tmp = dir.join("preview-part.mp4");
             let mut a = strings(&["-i"]);
@@ -300,7 +425,12 @@ async fn prepare_preview(
             a.extend(strings(&[
                 "-map",
                 "0:v:0",
-                "-an",
+                "-map",
+                "0:a:0?",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
                 "-vf",
                 "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,fps=30",
                 "-c:v",
@@ -398,13 +528,34 @@ fn filter(r: &ExportRequest, scale: f64) -> (String, u32, u32) {
         h,
     )
 }
-fn base(r: &ExportRequest, input: &Path, scale: f64, start: f64, length: f64) -> Vec<String> {
+fn audio_filter(speed: f64) -> String {
+    let mut tempo = speed;
+    let mut filters = vec!["asetpts=PTS-STARTPTS".to_string()];
+    while tempo > 2. {
+        filters.push("atempo=2".into());
+        tempo /= 2.;
+    }
+    while tempo < 0.5 {
+        filters.push("atempo=0.5".into());
+        tempo /= 0.5;
+    }
+    filters.push(format!("atempo={tempo}"));
+    filters.push("apad".into());
+    filters.join(",")
+}
+fn base(
+    r: &ExportRequest,
+    input: &Path,
+    scale: f64,
+    start: f64,
+    length: f64,
+    include_audio: bool,
+) -> Vec<String> {
     let mut a = strings(&["-ss", &start.to_string(), "-t", &length.to_string(), "-i"]);
     a.push(input.display().to_string());
     a.extend(strings(&[
         "-map",
         "0:v:0",
-        "-an",
         "-sn",
         "-dn",
         "-vf",
@@ -416,6 +567,21 @@ fn base(r: &ExportRequest, input: &Path, scale: f64, start: f64, length: f64) ->
         "-pix_fmt",
         "yuv420p",
     ]));
+    a.extend(strings(&["-t", &(length / r.speed).to_string()]));
+    if include_audio && !r.remove_audio {
+        a.extend(strings(&[
+            "-map",
+            "0:a:0?",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-af",
+            &audio_filter(r.speed),
+        ]));
+    } else {
+        a.push("-an".into());
+    }
     a
 }
 fn export(
@@ -429,7 +595,7 @@ fn export(
     let m = probe(input)?;
     validate(&r, &m)?;
     fs::create_dir_all(exports).map_err(|e| e.to_string())?;
-    let filename = if r.filename.ends_with(".mp4") {
+    let filename = if r.filename.to_lowercase().ends_with(".mp4") {
         r.filename.clone()
     } else {
         format!("{}.mp4", r.filename)
@@ -442,7 +608,7 @@ fn export(
     let result = (|| {
         let duration = (r.end - r.start) / r.speed;
         let tmp = dir.join("output.mp4");
-        let mut quality = base(&r, input, 1., r.start, r.end - r.start);
+        let mut quality = base(&r, input, 1., r.start, r.end - r.start, true);
         quality.extend(strings(&["-crf", "23", "-movflags", "+faststart"]));
         quality.push(tmp.display().to_string());
         run(
@@ -460,9 +626,15 @@ fn export(
         }
         let mut scale = 1.;
         let mut quality_warning = false;
-        let mut bitrate = r
-            .target
-            .map(|n| ((n as f64 * 0.97 * 8. / duration) as u64).max(1000));
+        let mut bitrate = r.target.map(|n| {
+            (n as f64 * 0.97 * 8. / duration
+                - if !r.remove_audio && m.has_audio {
+                    96_000.
+                } else {
+                    0.
+                })
+            .max(1000.) as u64
+        });
         if let Some(budget) = bitrate {
             quality_warning = true;
             // Sample three moments at CRF 28, our quality floor; prefer readable full-resolution text.
@@ -473,7 +645,7 @@ fn export(
                 for (i, pos) in [0., 0.5, 1.].iter().enumerate() {
                     let p = dir.join(format!("sample-{i}.mp4"));
                     let start = r.start + (r.end - r.start - sample_len) * pos;
-                    let mut a = base(&r, input, scale, start, sample_len);
+                    let mut a = base(&r, input, scale, start, sample_len, false);
                     a.extend(strings(&["-crf", "28"]));
                     a.push(p.display().to_string());
                     run(
@@ -494,7 +666,7 @@ fn export(
             }
         }
         for attempt in 0..3 {
-            let mut a = base(&r, input, scale, r.start, r.end - r.start);
+            let mut a = base(&r, input, scale, r.start, r.end - r.start, true);
             if let Some(b) = bitrate {
                 a.extend(strings(&[
                     "-b:v",
@@ -502,21 +674,20 @@ fn export(
                     "-passlogfile",
                     &dir.join("pass").display().to_string(),
                 ]));
-                let mut first = a.clone();
+                let mut first = base(&r, input, scale, r.start, r.end - r.start, false);
+                first.extend(strings(&[
+                    "-b:v",
+                    &b.to_string(),
+                    "-passlogfile",
+                    &dir.join("pass").display().to_string(),
+                ]));
                 first.extend(strings(&["-pass", "1", "-f", "null"]));
                 first.push(if cfg!(windows) {
                     "NUL".into()
                 } else {
                     "/dev/null".into()
                 });
-                run(
-                    app,
-                    &first,
-                    dir,
-                    cancel,
-                    "Encoding · pass 1 of 2",
-                    duration,
-                )?;
+                run(app, &first, dir, cancel, "Encoding · pass 1 of 2", duration)?;
                 a.extend(strings(&["-pass", "2"]));
             } else {
                 a.extend(strings(&["-crf", "23"]));
@@ -581,6 +752,7 @@ fn save_export(
         duration: actual.duration,
         scale,
         quality_warning,
+        has_audio: actual.has_audio,
     })
 }
 #[tauri::command]
@@ -594,32 +766,32 @@ async fn export_video(
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         let input = source(&request.source)?;
-        let exports = app
-            .path()
-            .app_local_data_dir()
-            .map_err(|e| e.to_string())?
-            .join("exports");
+        let exports = PathBuf::from(&request.output_folder);
+        if !exports.is_absolute() {
+            return Err("Choose an absolute export folder with Save As.".into());
+        }
         let dir = cache(&app)?.join("export-work");
         let result = export(Some(&app), &cancel, request, &input, &exports, &dir)?;
         app.asset_protocol_scope()
             .allow_file(&result.path)
             .map_err(|e| e.to_string())?;
+        let p = Path::new(&result.path)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        app.state::<Jobs>()
+            .exports
+            .lock()
+            .map_err(|e| e.to_string())?
+            .push(p);
         Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 #[tauri::command]
-fn reveal_export(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    let root = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("exports")
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
+fn reveal_export(jobs: tauri::State<Jobs>, path: String) -> Result<(), String> {
     let p = Path::new(&path).canonicalize().map_err(|e| e.to_string())?;
-    if p.parent() != Some(root.as_path()) {
+    if !jobs.exports.lock().map_err(|e| e.to_string())?.contains(&p) {
         return Err("Only exports can be revealed.".into());
     }
     command("explorer")
@@ -657,7 +829,12 @@ fn main() {
             prepare_preview,
             export_video,
             cancel_job,
-            reveal_export
+            reveal_export,
+            load_settings,
+            save_settings,
+            choose_obs_folder,
+            choose_source,
+            choose_destination
         ])
         .run(tauri::generate_context!())
         .expect("could not run Encoder");
@@ -670,6 +847,8 @@ mod tests {
         ExportRequest {
             source: "2026-10-12_11-50-01.mkv".into(),
             filename: "demo".into(),
+            output_folder: String::new(),
+            remove_audio: true,
             start: 0.,
             end: 20.,
             speed: 1.,
@@ -694,6 +873,7 @@ mod tests {
             duration: 30.,
             width: 1920,
             height: 1080,
+            has_audio: true,
         };
         let mut r = request();
         assert!(validate(&r, &m).is_ok());
@@ -718,9 +898,138 @@ mod tests {
         assert!(f.contains("setpts=(PTS-STARTPTS)/2"));
     }
     #[test]
+    fn tempo_chain_and_arbitrary_source_validation() {
+        assert!(audio_filter(8.).contains("atempo=2,atempo=2,atempo=2"));
+        assert!(audio_filter(0.25).contains("atempo=0.5,atempo=0.5"));
+        assert!(source("relative-video.mp4").is_err());
+        assert!(source(env!("CARGO_MANIFEST_DIR")).is_err());
+    }
+    #[test]
+    #[ignore = "Requires FFmpeg; generates portable audio/video fixtures"]
+    fn arbitrary_files_and_retained_audio() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".work")
+            .join(format!("audio-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("a custom demo with spaces.mkv");
+        let status = command("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "8",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let input = source(&display_path(&input)).unwrap();
+        assert!(probe(&input).unwrap().has_audio);
+        for (i, speed) in [0.25, 2., 8.].into_iter().enumerate() {
+            let mut r = request();
+            r.filename = format!("audio-{i}");
+            r.start = 0.;
+            r.end = if speed == 0.25 { 1. } else { 8. };
+            r.speed = speed;
+            r.remove_audio = false;
+            r.crop = Crop {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 360,
+            };
+            let expected = r.end / speed;
+            let out = export(
+                None,
+                &AtomicBool::new(false),
+                r,
+                &input,
+                &root.join("chosen destination"),
+                &root.join("work"),
+            )
+            .unwrap();
+            assert!(out.has_audio);
+            assert!((out.duration - expected).abs() < 0.12);
+            assert!(out.bytes <= 3_800_000);
+            let pcm = command("ffmpeg")
+                .args(["-v", "error", "-ss", "0.2", "-i"])
+                .arg(&out.path)
+                .args([
+                    "-t", "0.5", "-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(pcm.status.success());
+            let samples: Vec<_> = pcm
+                .stdout
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            let crossings = samples.windows(2).filter(|w| w[0] <= 0 && w[1] > 0).count();
+            let hz = crossings as f64 / (samples.len() as f64 / 48000.);
+            assert!(
+                (hz - 440.).abs() < 10.,
+                "Pitch changed to {hz} Hz at {speed}x"
+            );
+            println!(
+                "Retained audio: {speed}x, {}s, {} bytes, {hz:.1} Hz",
+                out.duration, out.bytes
+            );
+        }
+        // Keeping audio is also valid for a video that never had an audio stream.
+        let silent = root.join("silent video.mp4");
+        let status = command("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&input)
+            .args(["-an", "-c:v", "copy"])
+            .arg(&silent)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut r = request();
+        r.filename = "silent".into();
+        r.end = 2.;
+        r.remove_audio = false;
+        r.crop = Crop {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 360,
+        };
+        let out = export(
+            None,
+            &AtomicBool::new(false),
+            r,
+            &silent,
+            &root.join("chosen destination"),
+            &root.join("work"),
+        )
+        .unwrap();
+        assert!(!out.has_audio);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     #[ignore = "Requires FFmpeg and the local OBS recording; run with --ignored --nocapture"]
     fn real_obs_exports() {
-        let input = source("2026-10-12_11-50-01.mkv").unwrap();
+        let input = source("E:\\cache\\obs\\2026-10-12_11-50-01.mkv").unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -795,7 +1104,7 @@ mod tests {
     #[test]
     #[ignore = "Requires FFmpeg and the longer local OBS recording"]
     fn real_obs_capped_fallback() {
-        let input = source("2026-10-12_11-49-12.mkv").unwrap();
+        let input = source("E:\\cache\\obs\\2026-10-12_11-49-12.mkv").unwrap();
         let m = probe(&input).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -810,6 +1119,7 @@ mod tests {
             width: m.width,
             height: m.height,
         };
+        r.remove_audio = false;
         let out = export(
             None,
             &AtomicBool::new(false),
@@ -820,6 +1130,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.bytes <= 3_800_000);
+        assert_eq!(out.has_audio, m.has_audio);
         assert!((out.duration - m.duration).abs() < 0.15);
         println!(
             "Fallback: {} bytes, {}x{}, {}s, scale {}",

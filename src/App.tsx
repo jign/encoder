@@ -4,8 +4,21 @@ import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Palette } from "@vanilla/petals/palette";
 
-type Recording = { name: string; bytes: number };
-type Media = { duration: number; width: number; height: number };
+type Recording = { name: string; path: string; bytes: number };
+type Media = {
+  duration: number;
+  width: number;
+  height: number;
+  has_audio: boolean;
+};
+type Settings = {
+  obs_mode: boolean;
+  obs_folder: string | null;
+  output_folder: string;
+  remove_audio: boolean;
+  today_only: boolean;
+  last_source: string | null;
+};
 type Crop = { x: number; y: number; width: number; height: number };
 type Progress = { stage: string; fraction: number };
 type Result = {
@@ -16,10 +29,14 @@ type Result = {
   duration: number;
   scale: number;
   quality_warning: boolean;
+  has_audio: boolean;
   start: number;
   speed: number;
 };
 const mb = (n: number) => `${(n / 1e6).toFixed(2)} MB`;
+const samePath = (a: string, b: string) =>
+  a.trim().replace(/^"|"$/g, "").replaceAll("\\", "/").toLowerCase() ===
+  b.trim().replaceAll("\\", "/").toLowerCase();
 const comparisonRate = (current: number, exported: number) =>
   Math.max(0.0625, Math.min(16, current / exported));
 const time = (n: number) =>
@@ -69,7 +86,19 @@ function Icon({
 }
 export default function App() {
   const [recordings, setRecordings] = useState<Recording[]>([]);
-  const [todayOnly, setTodayOnly] = useState(true);
+  const [settings, setSettings] = useState<Settings>();
+  const [sourceDraft, setSourceDraft] = useState("");
+  const todayOnly = settings?.today_only ?? true;
+  const obsMode = settings?.obs_mode ?? true;
+  const obsFolder = settings?.obs_folder;
+  const removeAudio = settings?.remove_audio ?? true;
+  const outputFolder = settings?.output_folder ?? "";
+  const updateSettings = (patch: Partial<Settings>) =>
+    setSettings((s) => (s ? { ...s, ...patch } : s));
+  const setTodayOnly = (value: boolean | ((value: boolean) => boolean)) =>
+    updateSettings({
+      today_only: typeof value === "function" ? value(todayOnly) : value,
+    });
   const [selected, setSelected] = useState<Recording>();
   const [media, setMedia] = useState<Media>();
   const [preview, setPreview] = useState("");
@@ -82,8 +111,10 @@ export default function App() {
   const [cropping, setCropping] = useState(false);
   const [playhead, setPlayhead] = useState(0),
     [playing, setPlaying] = useState(false);
-  const [busy, setBusy] = useState(false),
+  const [jobBusy, setBusy] = useState(false),
     [progress, setProgress] = useState<Progress>();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const busy = jobBusy || dialogOpen;
   const [error, setError] = useState(""),
     [result, setResult] = useState<Result>();
   const [compare, setCompare] = useState(true);
@@ -96,16 +127,47 @@ export default function App() {
   const [surfaceSize, setSurfaceSize] = useState({ width: 0, height: 0 });
   const drag = useRef<{ x: number; y: number } | null>(null);
   const requestId = useRef(0);
-  const refresh = useCallback(async () => {
+  const settingsWrites = useRef<Promise<unknown>>(Promise.resolve());
+  const sourceDirty = selected
+    ? !samePath(sourceDraft, selected.path)
+    : !!sourceDraft.trim();
+  useEffect(() => {
     if (!isTauri()) return;
+    let active = true;
+    void invoke<Settings>("load_settings")
+      .then((s) => {
+        if (!active) return;
+        setSettings(s);
+        if (s.last_source) void selectSource(s.last_source);
+      })
+      .catch((e) => setError(String(e)));
+    return () => {
+      active = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!settings || !isTauri()) return;
+    settingsWrites.current = settingsWrites.current
+      .catch(() => {})
+      .then(() => invoke("save_settings", { settings }))
+      .catch((e) => setError(`Could not save preferences: ${e}`));
+  }, [settings]);
+  const refresh = useCallback(async () => {
+    if (!isTauri() || !obsMode || !obsFolder) {
+      setRecordings([]);
+      return;
+    }
     try {
       setRecordings(
-        await invoke<Recording[]>("list_recordings", { todayOnly }),
+        await invoke<Recording[]>("list_recordings", {
+          folder: obsFolder,
+          todayOnly,
+        }),
       );
     } catch (e) {
       setError(String(e));
     }
-  }, [todayOnly]);
+  }, [todayOnly, obsMode, obsFolder]);
   useEffect(() => {
     void refresh();
     const interval = setInterval(() => {
@@ -137,7 +199,7 @@ export default function App() {
     observer.observe(ground);
     resize();
     return () => observer.disconnect();
-  }, [media, preview, compare, result]);
+  }, [media, preview, compare, result, obsMode]);
   useEffect(() => {
     if (
       sourceVideo.current &&
@@ -149,10 +211,14 @@ export default function App() {
     if (outputVideo.current && result && speed >= 0.25 && speed <= 8)
       outputVideo.current.playbackRate = comparisonRate(speed, result.speed);
   }, [speed, result, compare]);
-  async function select(recording: Recording) {
+  async function selectSource(filepath: string) {
+    if (jobBusy || !filepath.trim()) return;
+    const path = filepath.trim().replace(/^"|"$/g, "");
+    const name = path.split(/[\\/]/).pop() || "clip";
     const id = ++requestId.current;
     sourceVideo.current?.pause();
-    setSelected(recording);
+    setSelected({ name, path, bytes: 0 });
+    setSourceDraft(path);
     setMedia(undefined);
     setPreview("");
     setResult(undefined);
@@ -160,12 +226,12 @@ export default function App() {
     setPlaying(false);
     setPlayhead(0);
     setCropping(false);
-    setFilename(`${recording.name.slice(0, 19)}-web`);
+    setFilename(`${name.replace(/\.[^.]+$/, "") || "clip"}-web`);
     setBusy(true);
     setProgress({ stage: "Reading recording", fraction: 0 });
     try {
       const metadata = await invoke<Media>("inspect_recording", {
-        name: recording.name,
+        name: path,
       });
       if (id !== requestId.current) return;
       setMedia(metadata);
@@ -173,10 +239,13 @@ export default function App() {
       setEnd(metadata.duration);
       setSpeed(1);
       setCrop({ x: 0, y: 0, width: metadata.width, height: metadata.height });
-      const path = await invoke<string>("prepare_preview", {
-        name: recording.name,
+      const previewPath = await invoke<string>("prepare_preview", {
+        name: path,
       });
-      if (id === requestId.current) setPreview(convertFileSrc(path));
+      if (id === requestId.current) {
+        setPreview(convertFileSrc(previewPath));
+        updateSettings({ last_source: filepath.trim().replace(/^"|"$/g, "") });
+      }
     } catch (e) {
       if (id === requestId.current) setError(String(e));
     } finally {
@@ -184,6 +253,55 @@ export default function App() {
         setBusy(false);
         setProgress(undefined);
       }
+    }
+  }
+  async function browseSource() {
+    if (busy || !settings) return;
+    setDialogOpen(true);
+    try {
+      const path = await invoke<string | null>("choose_source", {
+        current: selected?.path ?? null,
+      });
+      if (path) await selectSource(path);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDialogOpen(false);
+    }
+  }
+  async function chooseObsFolder() {
+    if (busy || !settings) return;
+    setDialogOpen(true);
+    try {
+      const folder = await invoke<string | null>("choose_obs_folder", {
+        current: obsFolder ?? null,
+      });
+      if (folder) updateSettings({ obs_folder: folder });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDialogOpen(false);
+    }
+  }
+  async function saveAs() {
+    if (busy || !settings) return;
+    setDialogOpen(true);
+    try {
+      const destination = await invoke<{
+        folder: string;
+        filename: string;
+      } | null>("choose_destination", {
+        folder: outputFolder,
+        filename: filename.trim() || "clip-web",
+      });
+      if (destination) {
+        updateSettings({ output_folder: destination.folder });
+        setFilename(destination.filename);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDialogOpen(false);
     }
   }
   const finalDuration = (end - start) / speed;
@@ -195,7 +313,9 @@ export default function App() {
     end <= media.duration &&
     speed >= 0.25 &&
     speed <= 8 &&
-    filename.trim().length > 0;
+    filename.trim().length > 0 &&
+    !sourceDirty &&
+    !!outputFolder;
   function seek(t: number) {
     const v = sourceVideo.current;
     if (!v) return;
@@ -228,7 +348,7 @@ export default function App() {
     else setEnd(Math.max(playhead, start + 0.1));
   }
   async function encode() {
-    if (!selected || !valid || busy) return;
+    if (!selected || !valid || busy || sourceDirty || !outputFolder) return;
     sourceVideo.current?.pause();
     outputVideo.current?.pause();
     setBusy(true);
@@ -240,8 +360,10 @@ export default function App() {
         "export_video",
         {
           request: {
-            source: selected.name,
+            source: selected.path,
             filename: filename.trim(),
+            output_folder: outputFolder,
+            remove_audio: removeAudio,
             start,
             end,
             speed,
@@ -279,16 +401,32 @@ export default function App() {
         setPalette((v) => !v);
         return;
       }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        if (!busy) void browseSource();
+        return;
+      }
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.shiftKey &&
+        e.key.toLowerCase() === "s"
+      ) {
+        e.preventDefault();
+        if (!busy) void saveAs();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (!palette) void encode();
+        return;
+      }
       if (
         palette ||
         (e.target instanceof HTMLElement &&
           ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName))
       )
         return;
-      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-        e.preventDefault();
-        void encode();
-      } else if (!busy && preview) {
+      if (!busy && preview) {
         if (e.code === "Space") {
           e.preventDefault();
           togglePlayback();
@@ -342,6 +480,38 @@ export default function App() {
     });
   }
   const commands = [
+    {
+      id: "browse",
+      label: "Browse for source file",
+      shortcut: ["Ctrl+O"],
+      disabled: busy || !settings,
+      run: () => void browseSource(),
+    },
+    {
+      id: "obs-mode",
+      label: obsMode ? "Turn OBS mode off" : "Turn OBS mode on",
+      disabled: busy || !settings,
+      run: () => updateSettings({ obs_mode: !obsMode }),
+    },
+    {
+      id: "obs-folder",
+      label: "Change OBS cache folder",
+      disabled: busy || !settings,
+      run: () => void chooseObsFolder(),
+    },
+    {
+      id: "save-as",
+      label: "Save As…",
+      shortcut: ["Ctrl+Shift+S"],
+      disabled: busy || !settings,
+      run: () => void saveAs(),
+    },
+    {
+      id: "audio",
+      label: removeAudio ? "Keep audio" : "Remove audio",
+      disabled: busy || !settings,
+      run: () => updateSettings({ remove_audio: !removeAudio }),
+    },
     {
       id: "export",
       label: "Export clip",
@@ -404,71 +574,88 @@ export default function App() {
     })),
   ];
   return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">
-            <Icon name="film" />
-          </span>
-          <span>
-            Encoder<small>WHITE VANILLA SKIES</small>
-          </span>
-        </div>
-        <div className="sidebar-title">
-          <span>{todayOnly ? "Today’s recordings" : "All recordings"}</span>
-          <button
-            className="icon-button"
-            title="Refresh recordings"
-            onClick={() => void refresh()}
-          >
-            <Icon name="refresh" />
-          </button>
-        </div>
-        <div className="recording-list">
-          {recordings.map((r) => (
+    <div className={`app ${obsMode ? "" : "obs-off"}`}>
+      {obsMode && (
+        <aside className="sidebar">
+          <div className="brand">
+            <span className="brand-mark">
+              <Icon name="film" />
+            </span>
+            <span>
+              Encoder<small>WHITE VANILLA SKIES</small>
+            </span>
+          </div>
+          <div className="sidebar-title">
+            <span>{todayOnly ? "Today’s recordings" : "All recordings"}</span>
             <button
-              key={r.name}
-              disabled={busy}
-              className={`recording ${selected?.name === r.name ? "selected" : ""}`}
-              onClick={() => void select(r)}
+              className="icon-button"
+              title="Refresh recordings"
+              onClick={() => void refresh()}
             >
-              <span className="recording-icon">
-                <Icon name="film" />
-              </span>
-              <span className="recording-name">
-                <strong>{r.name.slice(11, 19).replaceAll("-", ":")}</strong>
-                <small>
-                  {r.name.slice(0, 10)} ·{" "}
-                  {r.name.split(".").pop()?.toUpperCase()}
-                </small>
-              </span>
-              <span className="recording-size">{mb(r.bytes)}</span>
+              <Icon name="refresh" />
             </button>
-          ))}
-          {!recordings.length && (
-            <div className="sidebar-empty">
-              {isTauri()
-                ? "No matching recordings."
-                : "Open the desktop app to load OBS recordings."}
-              <button onClick={() => setTodayOnly(false)}>
-                Show older recordings
+          </div>
+          <div className="recording-list">
+            {recordings.map((r) => (
+              <button
+                key={r.name}
+                disabled={busy}
+                className={`recording ${selected && samePath(selected.path, r.path) ? "selected" : ""}`}
+                onClick={() => void selectSource(r.path)}
+              >
+                <span className="recording-icon">
+                  <Icon name="film" />
+                </span>
+                <span className="recording-name">
+                  <strong>{r.name.slice(11, 19).replaceAll("-", ":")}</strong>
+                  <small>
+                    {r.name.slice(0, 10)} ·{" "}
+                    {r.name.split(".").pop()?.toUpperCase()}
+                  </small>
+                </span>
+                <span className="recording-size">{mb(r.bytes)}</span>
               </button>
-            </div>
-          )}
-        </div>
-        <div className="sidebar-bottom">
-          <span className="live-dot" /> OBS cache<code>E:\cache\obs</code>
-          <button
-            className="palette-trigger"
-            onClick={() => {
-              setQuery("");
-              setPalette(true);
-            }}
-          >
-            <Icon name="command" /> Commands <kbd>Ctrl K</kbd>
-          </button>
-        </div>
-      </aside>
+            ))}
+            {!recordings.length && (
+              <div className="sidebar-empty">
+                {!obsFolder
+                  ? "Choose your OBS cache folder to show recordings here."
+                  : isTauri()
+                    ? "No matching recordings."
+                    : "Open the desktop app to load OBS recordings."}
+                <button
+                  disabled={busy || !settings}
+                  onClick={() =>
+                    obsFolder ? setTodayOnly(false) : void chooseObsFolder()
+                  }
+                >
+                  {obsFolder ? "Show older recordings" : "Choose OBS folder…"}
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="sidebar-bottom">
+            <span className="live-dot" /> OBS cache
+            <code title={obsFolder ?? ""}>{obsFolder ?? "Not configured"}</code>
+            <button
+              className="change-folder"
+              disabled={busy || !settings}
+              onClick={() => void chooseObsFolder()}
+            >
+              Change folder…
+            </button>
+            <button
+              className="palette-trigger"
+              onClick={() => {
+                setQuery("");
+                setPalette(true);
+              }}
+            >
+              <Icon name="command" /> Commands <kbd>Ctrl K</kbd>
+            </button>
+          </div>
+        </aside>
+      )}
       <main>
         <header>
           <div>
@@ -479,18 +666,72 @@ export default function App() {
               <span>A little more focus.</span>
             </h1>
           </div>
-          <div className="format-badge">
-            <span className="live-dot" /> H.264 <span> / </span> MP4{" "}
-            <span> / </span> Silent
+          <div className="header-tools">
+            <div className="mode-tools">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={obsMode}
+                  disabled={busy || !settings}
+                  onChange={(e) =>
+                    updateSettings({ obs_mode: e.target.checked })
+                  }
+                />{" "}
+                OBS mode
+              </label>
+              <button
+                title="Commands (Ctrl K)"
+                onClick={() => {
+                  setQuery("");
+                  setPalette(true);
+                }}
+              >
+                <Icon name="command" />
+              </button>
+            </div>
+            <div className="format-badge">
+              <span className="live-dot" /> H.264 <span> / </span> MP4{" "}
+              <span> / </span> {removeAudio ? "Silent" : "Audio kept"}
+            </div>
           </div>
         </header>
         <div className="workspace-heading">
-          <div>
-            <strong>{selected?.name ?? "Choose a recording"}</strong>
+          <div className="source-controls">
+            <label htmlFor="source-path" className="source-label">
+              SOURCE FILE
+            </label>
+            <form
+              className="source-field"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!busy) void selectSource(sourceDraft);
+              }}
+            >
+              <input
+                id="source-path"
+                aria-label="Source file"
+                disabled={busy || !settings}
+                value={sourceDraft}
+                placeholder="Choose a recording or enter a video filepath"
+                title={sourceDraft}
+                onChange={(e) => setSourceDraft(e.target.value)}
+              />
+              {sourceDirty && (
+                <button disabled={busy || !sourceDraft.trim()}>Load</button>
+              )}
+              <button
+                type="button"
+                disabled={busy || !settings}
+                onClick={() => void browseSource()}
+              >
+                Browse…
+              </button>
+            </form>
             <span>
               {media
                 ? `${media.width} × ${media.height} · ${time(media.duration)}`
                 : "Your next demo starts here."}
+              {sourceDirty ? " · press Enter or Load to open" : ""}
             </span>
           </div>
           <div className="heading-actions">
@@ -521,7 +762,13 @@ export default function App() {
             <div className="viewport-label">
               <span>SOURCE</span>
               <span>
-                {cropping ? "Drag to frame your clip" : "Muted preview"}
+                {cropping
+                  ? "Drag to frame your clip"
+                  : removeAudio
+                    ? "Muted preview"
+                    : media?.has_audio
+                      ? "Audio preview"
+                      : "No audio track"}
               </span>
             </div>
             <div className="video-ground" ref={sourceGround}>
@@ -550,7 +797,7 @@ export default function App() {
                   <video
                     ref={sourceVideo}
                     src={preview}
-                    muted
+                    muted={removeAudio}
                     playsInline
                     preload="auto"
                     onLoadedMetadata={() => seek(start)}
@@ -626,7 +873,7 @@ export default function App() {
                   <p>
                     {busy
                       ? "Preparing a browser-friendly preview…"
-                      : "Select an OBS recording from the sidebar."}
+                      : "Browse for a video or select an OBS recording."}
                   </p>
                 </div>
               )}
@@ -898,11 +1145,20 @@ export default function App() {
                 disabled={busy}
                 placeholder="my-next-demo"
                 value={filename}
-                onChange={(e) => setFilename(e.target.value)}
+                onChange={(e) =>
+                  setFilename(e.target.value.replace(/\.mp4$/i, ""))
+                }
               />
               <span>.mp4</span>
             </div>
           </label>
+          <button
+            className="save-as-button"
+            disabled={busy || !settings}
+            onClick={() => void saveAs()}
+          >
+            Save As…
+          </button>
           <button
             className="export-button"
             disabled={!valid || busy}
@@ -915,7 +1171,21 @@ export default function App() {
           {target === null
             ? "Quality first · CRF 23"
             : "Fits your limit · resolution adapts when needed"}
-          <span>30 fps · audio removed · ready for the web</span>
+          <label className="audio-toggle">
+            <input
+              type="checkbox"
+              checked={removeAudio}
+              disabled={busy || !settings}
+              onChange={(e) =>
+                updateSettings({ remove_audio: e.target.checked })
+              }
+            />{" "}
+            Remove audio
+          </label>
+        </div>
+        <div className="destination" title={outputFolder}>
+          Saving to <span>{outputFolder || "Loading export folder…"}</span>
+          <small>30 fps · ready for the web</small>
         </div>
         {progress && (
           <div className="progress-row" role="status">
